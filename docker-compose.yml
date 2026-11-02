@@ -1,0 +1,155 @@
+# GrowKnow · one-command deployment
+# GrowKnow · 一键部署
+#
+#   cp .env.example .env && docker compose up -d --build
+#   Open http://localhost:8090
+#   打开 http://localhost:8090
+#
+# Data persistence. The host directory is set by HOST_DATA_DIR in .env (default ./data).
+# 数据持久化。宿主机目录由 .env 的 HOST_DATA_DIR 决定，默认 ./data。
+#   $HOST_DATA_DIR/postgres          PostgreSQL + pgvector + Apache AGE: knowledge bases, files,
+#                                    chunks, triples, graphs, skills, settings
+#                                    PostgreSQL + pgvector + Apache AGE：知识库 / 文件 / 切片 /
+#                                    三元组 / 图谱 / skill / 设置
+#   $HOST_DATA_DIR/uploads           uploaded original files
+#                                    上传的原始文件
+#   $HOST_DATA_DIR/work              parsing intermediates, cleaned up automatically when a job ends
+#                                    解析中间产物，任务结束自动清理
+#   $HOST_DATA_DIR/opencode/config   opencode provider config, generated from system settings
+#                                    opencode provider 配置，由系统设置自动生成
+#   $HOST_DATA_DIR/opencode/share    opencode session data
+#                                    opencode 会话数据
+#
+# Document parsing runs on MinerU. MinerU is not part of this compose.
+# 文档版面处理用 MinerU，本 compose 不含 MinerU。
+#   MINERU_MODE=agent                official lightweight API, no token required (default)
+#                                    官方轻量 API，免 Token（默认）
+#   MINERU_MODE=precision            official precise API, token required
+#                                    官方精准 API，需 Token
+#   MINERU_MODE=selfhost             start mineru-kit api-server yourself following MinerU's manual,
+#                                    then put its address in MINERU_URL
+#                                    按 MinerU 手册自行启动 mineru-kit api-server，
+#                                    并把地址填进 MINERU_URL
+name: growknow-kb
+
+x-backend-env: &backend-env
+  PG_HOST: db
+  PG_PORT: "5432"
+  PG_USER: ${PG_USER:-growknow}
+  PG_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD is required - run cp .env.example .env first}
+  PG_DATABASE: ${PG_DATABASE:-growknow}
+  AGE_GRAPH_NAME: ${AGE_GRAPH_NAME:-growknow_graph}
+  GRAPH_RENDER_MAX_NODES: ${GRAPH_RENDER_MAX_NODES:-800}
+  GRAPH_RENDER_MAX_EDGES: ${GRAPH_RENDER_MAX_EDGES:-2000}
+  OPENCODE_URL: http://opencode:4096
+  OPENCODE_CONFIG_PATH: /app/opencode-config/opencode.json
+  MINERU_MODE: ${MINERU_MODE:-agent}
+  MINERU_URL: ${MINERU_URL:-}
+  MINERU_API_KEY: ${MINERU_API_KEY:-}
+  MINERU_TIER: ${MINERU_TIER:-standard}
+  MINERU_LANGUAGE: ${MINERU_LANGUAGE:-ch}
+  DATA_DIR: /app/data
+  EXTRACT_CONCURRENCY: ${EXTRACT_CONCURRENCY:-2}
+  OPENCODE_TIMEOUT_SECONDS: ${OPENCODE_TIMEOUT_SECONDS:-900}
+  MAX_EXTRACT_CHARS: ${MAX_EXTRACT_CHARS:-8000}
+  VECTOR_CHUNK_CHARS: ${VECTOR_CHUNK_CHARS:-1200}
+  VECTOR_CHUNK_OVERLAP: ${VECTOR_CHUNK_OVERLAP:-120}
+  LLM_BASE_URL: ${LLM_BASE_URL:-}
+  LLM_MODEL: ${LLM_MODEL:-}
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+  EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+
+x-backend-volumes: &backend-volumes
+  - ${HOST_DATA_DIR:-./data}/uploads:/app/data/uploads
+  - ${HOST_DATA_DIR:-./data}/work:/app/data/work
+  - ${HOST_DATA_DIR:-./data}/opencode/config:/app/opencode-config
+
+services:
+  # ==================== PostgreSQL 16 + pgvector + Apache AGE ====================
+  db:
+    build:
+      context: ./docker/postgres-age
+    image: growknow-postgres-age:16
+    command: ["postgres", "-c", "shared_preload_libraries=age"]
+    environment:
+      POSTGRES_USER: ${PG_USER:-growknow}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD is required - run cp .env.example .env first}
+      POSTGRES_DB: ${PG_DATABASE:-growknow}
+    ports:
+      - "127.0.0.1:${PG_PORT:-5434}:5432"
+    volumes:
+      - ${HOST_DATA_DIR:-./data}/postgres:/var/lib/postgresql/data
+    shm_size: 1g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-growknow} -d ${PG_DATABASE:-growknow}"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
+  # ==================== OpenCode (official image) ====================
+  opencode:
+    image: ghcr.io/anomalyco/opencode:1.18.33
+    command: ["serve", "--hostname", "0.0.0.0", "--port", "4096"]
+    environment:
+      HOME: /root
+    volumes:
+      - ${HOST_DATA_DIR:-./data}/opencode/config:/root/.config/opencode
+      - ${HOST_DATA_DIR:-./data}/opencode/share:/root/.local/share/opencode
+    # Allow reaching LLM / embedding services that run on the host (e.g. local vLLM, Ollama).
+    # 允许访问宿主机上的 LLM / embedding 服务（例如本机 vLLM、Ollama）。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # ==================== GrowKnow API ====================
+  api:
+    build:
+      context: ./backend
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment: *backend-env
+    volumes: *backend-volumes
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+      opencode:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health',timeout=3)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ==================== Extraction worker (same image as the API) ====================
+  worker:
+    build:
+      context: ./backend
+    command: ["python", "-m", "app.worker"]
+    environment: *backend-env
+    volumes: *backend-volumes
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+      opencode:
+        condition: service_started
+    restart: unless-stopped
+
+  # ==================== Web (static frontend + /api reverse proxy) ====================
+  web:
+    build:
+      context: ./frontend
+    ports:
+      - "${WEB_PORT:-8090}:80"
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+
