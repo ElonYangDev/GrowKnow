@@ -152,6 +152,10 @@ def pool() -> ConnectionPool:
             config.PG_CONNINFO,
             min_size=1,
             max_size=max(4, config.EXTRACT_CONCURRENCY * 2 + 2),
+            # 抽取一个文件要几十分钟，池里的连接会长时间空闲；到点回收，避免用上半
+            # 小时前被 Docker/WSL 断掉的死连接
+            max_idle=600.0,
+            max_lifetime=3600.0,
             kwargs={"row_factory": dict_row},
             open=False,
         )

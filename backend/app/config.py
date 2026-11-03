@@ -42,9 +42,12 @@ PG_PASSWORD = _str("PG_PASSWORD", "")
 PG_DATABASE = _str("PG_DATABASE", "growknow")
 # search_path 追加 ag_catalog：Apache AGE 的 cypher()/create_graph() 等函数在该 schema
 # （图库本身也是一个 schema，图名不能与数据库用户同名，否则会被 "$user" 抢先解析）
+# keepalive：一个文件要抽几十分钟，期间连接大部分时间是空闲的，Docker/WSL 的连接跟踪
+# 会把这种空闲连接悄悄回收，下一次使用就报 "server closed the connection unexpectedly"
 PG_CONNINFO = (
     f"host={PG_HOST} port={PG_PORT} user={PG_USER} "
     f"password={PG_PASSWORD} dbname={PG_DATABASE} "
+    f"keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=5 "
     f"options='-c search_path=\"$user\",public,ag_catalog'"
 )
 
