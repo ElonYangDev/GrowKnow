@@ -16,16 +16,7 @@ GrowKnow is dedicated to building a complete and easy-to-use knowledge base solu
 
 ## 🎞️ Video
 
-<div align="center">
-  <video
-    src="https://res.cloudinary.com/kj04vdgf/video/upload/v1793694987/GrowKnow.mp4"
-    width="800"
-    controls
-    loop
-    muted
-    poster="https://res.cloudinary.com/kj04vdgf/image/upload/v1793696288/GrowKnow-cover.jpg">
-  </video>
-</div>
+https://github.com/user-attachments/assets/f4e9cb9d-ee8e-4c44-8194-c1b56f5db349
 
 ⬆️ If the video above does not work, please click on the backup link: [https://www.bilibili.com/video/BV1qZ4g6tEAz](…)  
 
