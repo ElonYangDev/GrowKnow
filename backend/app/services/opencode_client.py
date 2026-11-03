@@ -8,6 +8,7 @@ opencode 作为知识抽取的运行引擎：growknow 把「知识抽取 skill +
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -15,6 +16,11 @@ import httpx
 from .. import config
 
 log = logging.getLogger(__name__)
+
+# 连接层重试的退避基数（秒）；只对「请求没发出去」的失败生效
+_RETRY_BACKOFF = 2.0
+# 会话/配置这类轻量调用可以原地重试；模型生成调用交给流水线的分段容错
+_LIGHT_RETRIES = 2
 
 
 class OpenCodeError(Exception):
@@ -25,12 +31,33 @@ def _timeout(read: float | None = None) -> httpx.Timeout:
     return httpx.Timeout(read or config.OPENCODE_TIMEOUT_SECONDS, connect=10.0)
 
 
-def _request(method: str, path: str, body: Any = None, read_timeout: float | None = None) -> Any:
-    try:
-        with httpx.Client(base_url=config.OPENCODE_URL, timeout=_timeout(read_timeout)) as client:
-            response = client.request(method, path, json=body)
-    except httpx.HTTPError as exc:
-        raise OpenCodeError(f"抽取引擎不可达：{exc}") from exc
+def _request(
+    method: str,
+    path: str,
+    body: Any = None,
+    read_timeout: float | None = None,
+    retries: int = 0,
+) -> Any:
+    """调用 opencode。
+
+    retries 只用于「请求没发出去 / 连接层失败」这类传输错误（httpx.HTTPError），
+    引擎已经返回 4xx/5xx 时不重试——那类响应里包含了模型与会话的真实状态。
+    """
+    attempt = 0
+    while True:
+        try:
+            with httpx.Client(base_url=config.OPENCODE_URL, timeout=_timeout(read_timeout)) as client:
+                response = client.request(method, path, json=body)
+            break
+        except httpx.HTTPError as exc:
+            if attempt >= retries:
+                raise OpenCodeError(f"抽取引擎不可达：{exc}") from exc
+            attempt += 1
+            log.warning(
+                "抽取引擎连接失败（%s %s），%.0f 秒后第 %d 次重试：%s",
+                method, path, _RETRY_BACKOFF * attempt, attempt, exc,
+            )
+            time.sleep(_RETRY_BACKOFF * attempt)
     if response.status_code >= 400:
         detail = response.text[:500]
         raise OpenCodeError(f"抽取引擎返回 HTTP {response.status_code}：{detail}")
@@ -43,17 +70,19 @@ def _request(method: str, path: str, body: Any = None, read_timeout: float | Non
 
 
 def health() -> dict:
-    data = _request("GET", "/global/health", read_timeout=10.0)
+    data = _request("GET", "/global/health", read_timeout=10.0, retries=_LIGHT_RETRIES)
     return data if isinstance(data, dict) else {"healthy": False}
 
 
 def apply_global_config(cfg: dict) -> dict:
-    data = _request("PATCH", "/global/config", body=cfg, read_timeout=30.0)
+    data = _request(
+        "PATCH", "/global/config", body=cfg, read_timeout=30.0, retries=_LIGHT_RETRIES
+    )
     return data if isinstance(data, dict) else {}
 
 
 def list_providers() -> dict:
-    data = _request("GET", "/provider", read_timeout=30.0)
+    data = _request("GET", "/provider", read_timeout=30.0, retries=_LIGHT_RETRIES)
     return data if isinstance(data, dict) else {}
 
 
@@ -94,6 +123,7 @@ def create_session(title: str, model: str) -> str:
             "model": {"id": model, "providerID": config.OPENCODE_MODEL_PROVIDER},
         },
         read_timeout=30.0,
+        retries=_LIGHT_RETRIES,
     )
     session_id = (data or {}).get("id") if isinstance(data, dict) else None
     if not session_id:
@@ -129,6 +159,8 @@ def prompt(session_id: str, text: str, system: str | None, model: str) -> str:
 
 def delete_session(session_id: str) -> None:
     try:
-        _request("DELETE", f"/session/{session_id}", read_timeout=10.0)
+        _request(
+            "DELETE", f"/session/{session_id}", read_timeout=10.0, retries=_LIGHT_RETRIES
+        )
     except OpenCodeError as exc:
         log.debug("删除 opencode 会话失败：%s", exc)

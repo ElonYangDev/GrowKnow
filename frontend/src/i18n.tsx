@@ -928,6 +928,8 @@ export function stageLabel(stage: string, lang: Lang): string {
   if (match) return `Embedding batch ${match[1]}/${match[2]}`
   match = stage.match(/^向量化（共 (\d+) 批）$/)
   if (match) return `Embedding (${match[1]} batch${match[1] === '1' ? '' : 'es'})`
+  match = stage.match(/^完成（跳过 (\d+) 段）$/)
+  if (match) return `Done (${match[1]} segment${match[1] === '1' ? '' : 's'} skipped)`
   return stage
 }
 

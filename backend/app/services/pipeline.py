@@ -11,6 +11,8 @@ import re
 import shutil
 from pathlib import Path
 
+import psycopg
+
 from .. import config, db
 from . import age_store, embedding, mineru, opencode_client, settings, split
 
@@ -165,6 +167,44 @@ def _ask_json(
     raise PipelineError(f"模型输出不是合法 JSON：{last}")
 
 
+# 单个子段允许的失败类型：引擎不可达 / 契约不合 / 写库报错。
+# CancelledError 不在其中，取消必须原样冒到收尾逻辑。
+_SEGMENT_ERRORS: tuple[type[Exception], ...] = (
+    opencode_client.OpenCodeError,
+    PipelineError,
+    age_store.GraphStoreError,
+    ValueError,
+    TypeError,
+    psycopg.Error,
+)
+
+
+def _session_title(row: dict) -> str:
+    return f"{row['kb_name']} · {row['name']}"
+
+
+def _ask_segment(
+    row: dict, session_id: str, prompt: str, system: str, model: str, segment_no: int
+) -> tuple[str, dict]:
+    """抽取一个子段，返回（会话 ID, 模型 JSON）。
+
+    引擎侧一失败就换一个全新会话把这段重问一次：一个子段的 prompt 本身是自包含的
+    （提示里写明只处理本子段），换会话不会丢上下文；重问仍失败则抛给调用方记账。
+    """
+    try:
+        return session_id, _ask_json(session_id, prompt, system, model)
+    except opencode_client.OpenCodeError as exc:
+        if _job_status(row["id"]) == "canceled":
+            raise CancelledError("抽取已取消") from exc
+        log.warning(
+            "文件 %s 第 %d 段抽取失败（%s），换新会话重问一次", row["name"], segment_no, exc
+        )
+    opencode_client.delete_session(session_id)
+    fresh = opencode_client.create_session(_session_title(row), model)
+    _set_session(row["id"], fresh)
+    return fresh, _ask_json(fresh, prompt, system, model)
+
+
 def _attributes(item: dict, reserved: set[str], limit: int = 40) -> dict:
     """收集固定字段之外的附加属性（skill 抽多少存多少，数量上限仅防跑飞）。"""
     attrs: dict = {}
@@ -252,7 +292,7 @@ def _load(file_id: int) -> dict:
     return row
 
 
-def _run_vector(row: dict, parts: list[split.Part]) -> int:
+def _run_vector(row: dict, parts: list[split.Part]) -> tuple[int, int]:
     texts: list[str] = []
     with db.connection() as conn:
         conn.execute("DELETE FROM kb_chunk WHERE file_id = %s", (row["id"],))
@@ -316,14 +356,77 @@ def _run_vector(row: dict, parts: list[split.Part]) -> int:
                 for chunk_id, vector in zip(chunk_ids, vectors)
             ],
         )
-    return len(chunk_ids)
+    return len(chunk_ids), 0
 
 
 def _vector_literal(vector: list[float]) -> str:
     return "[" + ",".join(f"{value:.8f}" for value in vector) + "]"
 
 
-def _run_triple(row: dict, parts: list[split.Part], cfg: dict) -> int:
+def _account_skipped(
+    row: dict, skipped: int, total: int, last_error: Exception | None
+) -> None:
+    """子段失败的收尾口径：一段都没成才算文件失败，部分跳过保留已抽到的知识。"""
+    if total and skipped == total:
+        raise PipelineError(f"全部 {total} 段抽取失败，最后一段：{last_error}") from last_error
+    if skipped:
+        log.warning(
+            "文件 %s 有 %d/%d 段抽取失败，已跳过这些段落", row["name"], skipped, total
+        )
+
+
+def _apply_triples(
+    row: dict, part: split.Part, data: dict, seen: set[tuple[str, str, str]]
+) -> int:
+    """把一段的模型输出清洗成三元组并写库，返回本段新增条数。"""
+    items = data.get("triples") or data.get("records") or []
+    if not isinstance(items, list):
+        raise PipelineError("模型返回的 triples 不是数组")
+    rows: list[tuple] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        subject = _clean(item.get("subject"), 200)
+        predicate = _clean(item.get("predicate"), 120)
+        obj = _clean(item.get("object"), 200)
+        if not (subject and predicate and obj):
+            continue
+        key = (subject.lower(), predicate.lower(), obj.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        page_start, page_end = _page_of(item, part)
+        rows.append(
+            (
+                row["kb_id"],
+                row["id"],
+                len(seen),
+                page_start,
+                page_end,
+                subject,
+                _clean(item.get("subject_type"), 60),
+                predicate,
+                obj,
+                _clean(item.get("object_type"), 60),
+                _clean(item.get("evidence"), 500),
+            )
+        )
+    if not rows:
+        return 0
+    with db.connection() as conn:
+        conn.cursor().executemany(
+            """
+            INSERT INTO kb_triple
+              (kb_id, file_id, seq, page_start, page_end, subject, subject_type,
+               predicate, object, object_type, evidence)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def _run_triple(row: dict, parts: list[split.Part], cfg: dict) -> tuple[int, int]:
     model = (cfg["llm"].get("model") or "").strip()
     provider = settings.opencode_config(cfg)
     _check_cancel(row["id"])
@@ -336,13 +439,13 @@ def _run_triple(row: dict, parts: list[split.Part], cfg: dict) -> int:
         for part in parts
     ]
     total_segments = sum(len(items) for _, items in segments)
-    session_id = opencode_client.create_session(
-        f"{row['kb_name']} · {row['name']}", model
-    )
+    session_id = opencode_client.create_session(_session_title(row), model)
     _set_session(row["id"], session_id)
     seen: set[tuple[str, str, str]] = set()
     count = 0
     done = 0
+    skipped = 0
+    last_error: Exception | None = None
     try:
         for part, chunks in segments:
             for index, segment in enumerate(chunks, start=1):
@@ -364,52 +467,19 @@ def _run_triple(row: dict, parts: list[split.Part], cfg: dict) -> int:
                     "请按输出契约抽取三元组，只返回 JSON。\n\n"
                     f"--- 正文开始 ---\n{segment}\n--- 正文结束 ---"
                 )
-                data = _ask_json(session_id, prompt, system, model)
-                _check_cancel(row["id"])
-                items = data.get("triples") or data.get("records") or []
-                if not isinstance(items, list):
-                    raise PipelineError("模型返回的 triples 不是数组")
-                rows: list[tuple] = []
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    subject = _clean(item.get("subject"), 200)
-                    predicate = _clean(item.get("predicate"), 120)
-                    obj = _clean(item.get("object"), 200)
-                    if not (subject and predicate and obj):
-                        continue
-                    key = (subject.lower(), predicate.lower(), obj.lower())
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    page_start, page_end = _page_of(item, part)
-                    rows.append(
-                        (
-                            row["kb_id"],
-                            row["id"],
-                            len(seen),
-                            page_start,
-                            page_end,
-                            subject,
-                            _clean(item.get("subject_type"), 60),
-                            predicate,
-                            obj,
-                            _clean(item.get("object_type"), 60),
-                            _clean(item.get("evidence"), 500),
-                        )
+                try:
+                    session_id, data = _ask_segment(
+                        row, session_id, prompt, system, model, done
                     )
-                if rows:
-                    with db.connection() as conn:
-                        conn.cursor().executemany(
-                            """
-                            INSERT INTO kb_triple
-                              (kb_id, file_id, seq, page_start, page_end, subject, subject_type,
-                               predicate, object, object_type, evidence)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            """,
-                            rows,
-                        )
-                    count += len(rows)
+                    _check_cancel(row["id"])
+                    count += _apply_triples(row, part, data, seen)
+                except _SEGMENT_ERRORS as exc:
+                    skipped += 1
+                    last_error = exc
+                    log.warning(
+                        "文件 %s 第 %d/%d 段抽取失败，跳过该段：%s",
+                        row["name"], done, total_segments, exc,
+                    )
                 if total_segments > 1:
                     _set_progress(
                         row["id"],
@@ -419,11 +489,77 @@ def _run_triple(row: dict, parts: list[split.Part], cfg: dict) -> int:
     finally:
         opencode_client.delete_session(session_id)
         _set_session(row["id"], None)
+    _account_skipped(row, skipped, total_segments, last_error)
     _set_progress(row["id"], "整理结果", 95)
-    return count
+    return count, skipped
 
 
-def _run_graph(row: dict, parts: list[split.Part], cfg: dict) -> int:
+def _apply_graph_segment(
+    row: dict,
+    data: dict,
+    entity_names: set[str],
+    relation_keys: set[tuple[str, str, str]],
+) -> None:
+    """把一段的模型输出清洗成实体与关系并写入图谱。"""
+    entities = data.get("entities") or []
+    relations = data.get("relations") or []
+    if not isinstance(entities, list) or not isinstance(relations, list):
+        raise PipelineError("模型返回的 entities/relations 不是数组")
+    clean_entities = []
+    for item in entities:
+        if not isinstance(item, dict):
+            continue
+        name = _clean(item.get("name"), 200)
+        if not name:
+            continue
+        entity_names.add(name)
+        clean_entities.append(
+            {
+                "name": name,
+                "type": _clean(item.get("type"), 60),
+                "description": _clean(item.get("description"), 600),
+                "attributes": _attributes(item, {"name", "type", "description", "page"}),
+            }
+        )
+    clean_relations = []
+    for item in relations:
+        if not isinstance(item, dict):
+            continue
+        source = _clean(item.get("source"), 200)
+        target = _clean(item.get("target"), 200)
+        predicate = _clean(item.get("predicate"), 120)
+        if not (source and target and predicate) or source == target:
+            continue
+        relation_keys.add((source, predicate, target))
+        entity_names.add(source)
+        entity_names.add(target)
+        clean_relations.append(
+            {
+                "source": source,
+                "source_type": _clean(item.get("source_type"), 60),
+                "target": target,
+                "target_type": _clean(item.get("target_type"), 60),
+                "predicate": predicate,
+                "description": _clean(item.get("description"), 600),
+                "attributes": _attributes(
+                    item,
+                    {
+                        "source",
+                        "source_type",
+                        "target",
+                        "target_type",
+                        "predicate",
+                        "description",
+                        "page",
+                    },
+                ),
+            }
+        )
+    if clean_entities or clean_relations:
+        age_store.upsert_graph(row["kb_key"], row["id"], clean_entities, clean_relations)
+
+
+def _run_graph(row: dict, parts: list[split.Part], cfg: dict) -> tuple[int, int]:
     model = (cfg["llm"].get("model") or "").strip()
     provider = settings.opencode_config(cfg)
     _check_cancel(row["id"])
@@ -436,13 +572,13 @@ def _run_graph(row: dict, parts: list[split.Part], cfg: dict) -> int:
         for part in parts
     ]
     total_segments = sum(len(chunks) for _, chunks in segments)
-    session_id = opencode_client.create_session(
-        f"{row['kb_name']} · {row['name']}", model
-    )
+    session_id = opencode_client.create_session(_session_title(row), model)
     _set_session(row["id"], session_id)
     entity_names: set[str] = set()
     relation_keys: set[tuple[str, str, str]] = set()
     done = 0
+    skipped = 0
+    last_error: Exception | None = None
     try:
         for part, chunks in segments:
             for index, segment in enumerate(chunks, start=1):
@@ -464,67 +600,18 @@ def _run_graph(row: dict, parts: list[split.Part], cfg: dict) -> int:
                     "请按输出契约抽取实体与关系，只返回 JSON。\n\n"
                     f"--- 正文开始 ---\n{segment}\n--- 正文结束 ---"
                 )
-                data = _ask_json(session_id, prompt, system, model)
-                _check_cancel(row["id"])
-                entities = data.get("entities") or []
-                relations = data.get("relations") or []
-                if not isinstance(entities, list) or not isinstance(relations, list):
-                    raise PipelineError("模型返回的 entities/relations 不是数组")
-                clean_entities = []
-                for item in entities:
-                    if not isinstance(item, dict):
-                        continue
-                    name = _clean(item.get("name"), 200)
-                    if not name:
-                        continue
-                    entity_names.add(name)
-                    clean_entities.append(
-                        {
-                            "name": name,
-                            "type": _clean(item.get("type"), 60),
-                            "description": _clean(item.get("description"), 600),
-                            "attributes": _attributes(
-                                item, {"name", "type", "description", "page"}
-                            ),
-                        }
+                try:
+                    session_id, data = _ask_segment(
+                        row, session_id, prompt, system, model, done
                     )
-                clean_relations = []
-                for item in relations:
-                    if not isinstance(item, dict):
-                        continue
-                    source = _clean(item.get("source"), 200)
-                    target = _clean(item.get("target"), 200)
-                    predicate = _clean(item.get("predicate"), 120)
-                    if not (source and target and predicate) or source == target:
-                        continue
-                    relation_keys.add((source, predicate, target))
-                    entity_names.add(source)
-                    entity_names.add(target)
-                    clean_relations.append(
-                        {
-                            "source": source,
-                            "source_type": _clean(item.get("source_type"), 60),
-                            "target": target,
-                            "target_type": _clean(item.get("target_type"), 60),
-                            "predicate": predicate,
-                            "description": _clean(item.get("description"), 600),
-                            "attributes": _attributes(
-                                item,
-                                {
-                                    "source",
-                                    "source_type",
-                                    "target",
-                                    "target_type",
-                                    "predicate",
-                                    "description",
-                                    "page",
-                                },
-                            ),
-                        }
-                    )
-                if clean_entities or clean_relations:
-                    age_store.upsert_graph(
-                        row["kb_key"], row["id"], clean_entities, clean_relations
+                    _check_cancel(row["id"])
+                    _apply_graph_segment(row, data, entity_names, relation_keys)
+                except _SEGMENT_ERRORS as exc:
+                    skipped += 1
+                    last_error = exc
+                    log.warning(
+                        "文件 %s 第 %d/%d 段抽取失败，跳过该段：%s",
+                        row["name"], done, total_segments, exc,
                     )
                 if total_segments > 1:
                     _set_progress(
@@ -535,8 +622,9 @@ def _run_graph(row: dict, parts: list[split.Part], cfg: dict) -> int:
     finally:
         opencode_client.delete_session(session_id)
         _set_session(row["id"], None)
+    _account_skipped(row, skipped, total_segments, last_error)
     _set_progress(row["id"], "整理结果", 95)
-    return len(entity_names) + len(relation_keys)
+    return len(entity_names) + len(relation_keys), skipped
 
 
 def _purge_knowledge(file_id: int, kb_key: str, kind: str) -> None:
@@ -577,23 +665,24 @@ def process_file(file_id: int) -> None:
             row["name"], page_count, len(parts), row["page_slices"],
         )
         if row["kind"] == "vector":
-            count = _run_vector(row, parts)
+            count, skipped = _run_vector(row, parts)
         elif row["kind"] == "triple":
-            count = _run_triple(row, parts, cfg)
+            count, skipped = _run_triple(row, parts, cfg)
         else:
-            count = _run_graph(row, parts, cfg)
+            count, skipped = _run_graph(row, parts, cfg)
         _check_cancel(file_id)
-        _set_progress(file_id, "完成", 100)
+        stage = "完成" if not skipped else f"完成（跳过 {skipped} 段）"
+        _set_progress(file_id, stage, 100)
         _mark(
             file_id,
             "ready",
             error=None,
             page_count=page_count,
             knowledge_count=count,
-            stage="完成",
+            stage=stage,
             progress=100,
         )
-        log.info("文件 %s 抽取完成：%d 条知识", row["name"], count)
+        log.info("文件 %s 抽取完成：%d 条知识，跳过 %d 段", row["name"], count, skipped)
     except CancelledError:
         log.info("文件 %s 抽取已取消，清理本次写入的知识", row["name"])
         _purge_knowledge(file_id, row["kb_key"], row["kind"])
