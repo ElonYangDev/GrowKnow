@@ -7,13 +7,28 @@
 English · [简体中文](#growknow-1)
 
 </div>
-<br />
 
-> Turn a general-purpose LLM Agent into an expert Agent that understands your field and your business better.
+> Turn a general-purpose LLM Agent into an expert Agent that understands your field and your business better.  
 
 How do you make a general-purpose LLM Agent an expert that really understands your field and your business? Building a knowledge base is currently the most mainstream approach. Yet building one is still not an easy thing to do.
 
 GrowKnow is dedicated to building a complete and easy-to-use knowledge base solution: you upload files, GrowKnow automatically mines knowledge out of them and builds the knowledge base, and supports incremental updates. Your Agent supplies the keywords, and GrowKnow recalls the relevant knowledge from the knowledge base you specify and returns it to the Agent.
+
+## 🎞️ Video
+
+<div align="center">
+  <video
+    src="https://res.cloudinary.com/kj04vdgf/video/upload/v1793694987/GrowKnow.mp4"
+    width="800"
+    controls
+    loop
+    muted
+    poster="https://res.cloudinary.com/kj04vdgf/image/upload/v1793696288/GrowKnow-cover.jpg">
+  </video>
+</div>
+
+⬆️ If the video above does not work, please click on the backup link: [https://www.bilibili.com/video/BV1qZ4g6tEAz](…)  
+
 
 ## ⭐ Key Features
 
