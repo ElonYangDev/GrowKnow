@@ -1,0 +1,7 @@
+# Keep LF in the repository and in every working tree. Containers execute the
+# shell scripts under docker/ directly, and a CRLF checkout on Windows would
+# break them (bash: /docker-entrypoint-initdb.d/x.sh: bad interpreter).
+# 仓库和工作树统一使用 LF。容器会直接执行 docker/ 下的 shell 脚本，Windows 上
+# clone 出 CRLF 会让它们启动失败（bash: bad interpreter）。
+* text=auto eol=lf
+*.sh text eol=lf
