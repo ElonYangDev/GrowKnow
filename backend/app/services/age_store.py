@@ -9,7 +9,8 @@
 - 每个节点/关系带 file_ids（来源 kb_file.id 列表），删除文件时按引用计数清理。
 
 AGE 1.6 的实测限制（决定了上面的 JSON 文本形态）：
-- cypher 不支持查询参数，所有值必须经 _agstr 转义后内联；
+- cypher 不支持查询参数，所有值必须经 _agstr 按 Cypher 规则转义后内联（SQL 的双写
+  单引号在这里不成立）；正文用 $gk$ 定界，避免文本里的 $$ 提前闭合；
 - map 字面量的键只能是裸 ASCII 标识符（中文键会报错或丢失），成对数组的行内
   下标访问也不可靠，因此 attrs 整体序列化为 JSON 文本；
 - AGE 语句必须经 psycopg 以 params=None 发送，否则正文中的 % 会被当作格式化
@@ -21,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 from typing import Iterable
 
 from .. import config, db
@@ -63,11 +65,20 @@ def _graph_name() -> str:
     return name
 
 
+# Cypher 字符串字面量的合法转义只有 \" \' \\ \b \f \n \r \t \uXXXX；
+# 单引号双写（''）是 SQL 的规则，Cypher 解析器会把 'model''s' 切成两段而报语法错误。
+# 顺序很重要：先补反斜杠，再转义其余字符。
+_CYPHER_ESCAPE = (("\\", "\\\\"), ("'", "\\'"), ("\r", "\\r"), ("\n", "\\n"), ("\t", "\\t"))
+
+
 def _agstr(value) -> str:
-    """Python 值 → agtype 字符串字面量（转义反斜杠与单引号）。"""
+    """Python 值 → agtype 字符串字面量（按 Cypher 规则转义反斜杠、单引号与控制字符）。"""
     if value is None:
         return "NULL"
-    return "'" + str(value).replace("\\", "\\\\").replace("'", "''") + "'"
+    text = str(value)
+    for needle, replacement in _CYPHER_ESCAPE:
+        text = text.replace(needle, replacement)
+    return "'" + text + "'"
 
 
 def _agstrlist(values: Iterable[str]) -> str:
@@ -156,12 +167,23 @@ def _attrs_of(item: dict, reserved: set[str]) -> dict:
     return cleaned
 
 
+_DOLLAR_TAG = "$gk$"
+
+
+def _dollar_tag(cypher_text: str) -> str:
+    """cypher 正文的 SQL 定界符；正文里真出现 $gk$ 时改用随机 tag，避免提前闭合。"""
+    if _DOLLAR_TAG in cypher_text:
+        return f"$gk{secrets.token_hex(4)}$"
+    return _DOLLAR_TAG
+
+
 def _cypher(cypher_text: str, ncols: int = 1) -> list:
     """执行 cypher 子查询；params=None 让 psycopg 原样发送 SQL。"""
     cols = ", ".join(f"c{index} agtype" for index in range(ncols))
+    tag = _dollar_tag(cypher_text)
     sql = (
         f"SELECT * FROM ag_catalog.cypher('{_graph_name()}', "
-        f"$$ {cypher_text} $$) AS ({cols})"
+        f"{tag} {cypher_text} {tag}) AS ({cols})"
     )
     rows = db.fetch_all(sql, None)
     result = []
