@@ -241,7 +241,7 @@ export default function SettingsPage() {
             </span>
             <input
               className="input mono"
-              placeholder="http://172.24.199.104:8000/v1"
+              placeholder="https://api.openai.com/v1"
               value={llm.base_url}
               onChange={(event) => setLlm({ ...llm, base_url: event.target.value })}
             />
@@ -420,7 +420,7 @@ export default function SettingsPage() {
                 <span className="field-label">{t('settings.baseUrl')}</span>
                 <input
                   className="input mono"
-                  placeholder="http://172.24.199.104:8003"
+                  placeholder="http://host.docker.internal:8000"
                   value={mineru.url}
                   onChange={(event) => setMineru({ ...mineru, url: event.target.value })}
                 />
