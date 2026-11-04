@@ -6,6 +6,7 @@ import copy
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 from .. import config, db
@@ -123,14 +124,8 @@ def effective_embedding() -> dict:
     }
 
 
-def opencode_config(settings: dict | None = None) -> dict | None:
-    cfg = settings or get_settings()
-    llm = cfg["llm"]
-    base_url = (llm.get("base_url") or "").strip()
-    model = (llm.get("model") or "").strip()
-    if not base_url or not model:
-        return None
-    entry = {
+def _model_entry(model: str) -> dict:
+    return {
         "name": model,
         "id": model,
         "tool_call": False,
@@ -138,6 +133,66 @@ def opencode_config(settings: dict | None = None) -> dict | None:
         "temperature": True,
         "limit": {"context": 200000, "output": 32000},
     }
+
+
+# 模型列表只在启动、改设置和抽取前用到，缓存一下，免得每个任务都去问一遍服务端。
+# 缓存按 base_url 记：换了 LLM 服务地址，上一家的模型名就不能再用了。
+_MODEL_LIST_TTL = 300.0
+_MODEL_LIST_CAP = 100
+_model_list_cache: dict = {"base_url": "", "ids": [], "at": 0.0}
+
+
+def llm_model_ids(cfg: dict | None = None) -> list[str]:
+    """列出 LLM 服务端当前可用的模型名，拿不到就返回空列表。
+
+    opencode 的模型注册表只在进程启动时读一次配置：PATCH /global/config 会写文件、
+    也会返回合并后的配置，但运行中的进程不一定认账——/provider 和 /config 可能还停在
+    启动时的快照上，dispose 与等待都刷不动（只能重启容器）。所以把服务端挂出的模型全
+    写进 provider：换到同一服务上的另一个模型时，新名字本来就在引擎的注册表里，
+    不用重启。
+    """
+    cfg = cfg or get_settings()
+    llm = cfg["llm"]
+    base_url = (llm.get("base_url") or "").strip().rstrip("/")
+    if not base_url:
+        return []
+    now = time.monotonic()
+    if (
+        _model_list_cache["ids"]
+        and _model_list_cache["base_url"] == base_url
+        and now - _model_list_cache["at"] < _MODEL_LIST_TTL
+    ):
+        return list(_model_list_cache["ids"])
+    headers = {}
+    if llm.get("api_key"):
+        headers["Authorization"] = "Bearer " + llm["api_key"]
+    ids: list[str] = []
+    try:
+        import httpx
+
+        response = httpx.get(base_url + "/models", headers=headers, timeout=10.0)
+        if response.status_code < 400:
+            ids = [
+                str(item.get("id"))
+                for item in (response.json().get("data") or [])
+                if isinstance(item, dict) and item.get("id")
+            ][:_MODEL_LIST_CAP]
+    except Exception as exc:  # noqa: BLE001 — 列表拿不到就只登记当前模型，不影响启动
+        log.warning("读取 LLM 模型列表失败，只登记当前模型：%s", exc)
+    _model_list_cache.update({"base_url": base_url, "ids": ids, "at": now})
+    return list(ids)
+
+
+def opencode_config(settings: dict | None = None) -> dict | None:
+    cfg = settings or get_settings()
+    llm = cfg["llm"]
+    base_url = (llm.get("base_url") or "").strip()
+    model = (llm.get("model") or "").strip()
+    if not base_url or not model:
+        return None
+    models = {model: _model_entry(model)}
+    for other in llm_model_ids(cfg):
+        models.setdefault(other, _model_entry(other))
     return {
         "$schema": "https://opencode.ai/config.json",
         "model": f"{config.OPENCODE_MODEL_PROVIDER}/{model}",
@@ -150,7 +205,7 @@ def opencode_config(settings: dict | None = None) -> dict | None:
                     "apiKey": (llm.get("api_key") or "sk-growknow").strip() or "sk-growknow",
                     "timeout": int(config.OPENCODE_TIMEOUT_SECONDS * 1000),
                 },
-                "models": {model: entry},
+                "models": models,
             }
         },
         "share": "disabled",
@@ -190,9 +245,21 @@ def sync_opencode_config(apply: bool = True) -> dict:
         log.warning(result["reason"])
         return result
     if apply:
+        model = (cfg.get("model") or "").split("/", 1)[-1]
         try:
             opencode_client.apply_global_config(cfg)
-            result["applied"] = True
+            if not opencode_client.wait_ready(model):
+                # 引擎的注册表停在启动时的快照上（换到另一台 LLM 服务时躲不开），
+                # 丢弃缓存再试一次
+                opencode_client.reload_instance()
+            if opencode_client.wait_ready(model):
+                result["applied"] = True
+            else:
+                result["reason"] = (
+                    f"抽取引擎未加载模型 {model}（引擎只在启动时读配置），"
+                    "请执行 docker compose restart opencode 后重新保存"
+                )
+                log.warning(result["reason"])
         except Exception as exc:  # noqa: BLE001
             result["reason"] = f"引擎暂不可达，配置将在其重启后生效：{exc}"
             log.warning(result["reason"])

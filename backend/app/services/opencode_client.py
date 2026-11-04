@@ -3,6 +3,10 @@
 opencode 作为知识抽取的运行引擎：growknow 把「知识抽取 skill + 输出契约 + 文档片段」
 作为一条消息发进会话，取回模型输出的 JSON。provider / 模型 / Key 由系统设置生成，
 启动时写入挂载的 opencode.json，并在设置变更时 PATCH /global/config 热更新。
+热更新能不能被运行中的进程吃到并不确定：同一份 PATCH 有时生效、有时 /provider
+和 /config 还停在启动时的快照上，dispose 和等待都刷不动（只能重启容器）。所以
+settings 会把 LLM 服务端挂出的模型全登记进 provider，换用同一服务上的其他模型时
+新名字本来就在注册表里；真的缺模型时 ensure_provider 直接报错并把重启命令写出来。
 """
 
 from __future__ import annotations
@@ -98,20 +102,48 @@ def provider_ready(model: str) -> bool:
     return False
 
 
+def reload_instance() -> None:
+    """让引擎丢弃当前实例与全局缓存。
+
+    兜底用：模型名正常应该已经由 settings 登记在 provider 里，走不到这里。
+    实测 dispose 并不会让引擎重读配置文件里的模型列表，但它是 HTTP 侧唯一的
+    重载入口，试一次不花钱；真刷不动时错误信息会把重启命令直接写给运维。
+    """
+    for path in ("/instance/dispose", "/global/dispose"):
+        try:
+            _request("POST", path, read_timeout=30.0, retries=_LIGHT_RETRIES)
+        except OpenCodeError as exc:
+            log.warning("抽取引擎重载（%s）失败：%s", path, exc)
+
+
+def wait_ready(model: str, attempts: int = 6, interval: float = 0.5) -> bool:
+    """等引擎的 provider 列表跟上当前配置。"""
+    for _ in range(attempts):
+        if provider_ready(model):
+            return True
+        time.sleep(interval)
+    return provider_ready(model)
+
+
 def ensure_provider(cfg: dict | None, model: str) -> None:
     if not cfg or not model:
         raise OpenCodeError("尚未配置 LLM（系统设置 → LLM 配置）")
-    if not provider_ready(model):
-        apply_global_config(cfg)
-        if not provider_ready(model):
-            # 刚启动的引擎加载配置需要一点时间
-            import time
-
-            for _ in range(10):
-                time.sleep(0.5)
-                if provider_ready(model):
-                    return
-            raise OpenCodeError("抽取引擎未能加载 LLM 配置，请检查系统设置与 opencode 日志")
+    if provider_ready(model):
+        return
+    apply_global_config(cfg)
+    # 刚启动的引擎加载配置需要一点时间
+    if wait_ready(model):
+        return
+    reload_instance()
+    if wait_ready(model):
+        return
+    declared = ((cfg.get("provider") or {}).get(config.OPENCODE_MODEL_PROVIDER) or {}).get("models") or {}
+    if model not in declared:
+        raise OpenCodeError(f"配置里没有模型 {model}，请检查系统设置 → LLM 配置的模型名")
+    raise OpenCodeError(
+        f"抽取引擎未加载模型 {model}（引擎只在启动时读配置），"
+        f"配置已写入 {config.OPENCODE_CONFIG_PATH}，请执行 docker compose restart opencode 后重试"
+    )
 
 
 def create_session(title: str, model: str) -> str:
